@@ -7,7 +7,7 @@ pysindy>=1.7.5
 pytest>=7.4
 
 # Torch (CPU)
-torch>=2.2.0
+torch>=2.2,<2.3
 
 # PyG and companions; wheels provided from the PyG index in CI
 torch-geometric>=2.5.0
