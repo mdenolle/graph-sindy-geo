@@ -1,18 +1,44 @@
 from __future__ import annotations
+import importlib.util
 import math
 from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
 import scipy.sparse as sp
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv
-from torch_geometric.utils import get_laplacian, to_scipy_sparse_matrix
 
-import pysindy as ps
+_TORCH_SPEC = importlib.util.find_spec("torch")
+if _TORCH_SPEC:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+else:  # pragma: no cover - exercised when torch is unavailable
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+
+_PYG_SPEC = importlib.util.find_spec("torch_geometric")
+if _PYG_SPEC:
+    from torch_geometric.data import Data  # type: ignore[assignment]
+    from torch_geometric.nn import GCNConv  # type: ignore[assignment]
+else:  # pragma: no cover - exercised when PyG is unavailable
+    Data = None  # type: ignore[assignment]
+    GCNConv = None  # type: ignore[assignment]
+
+_PYSINDY_SPEC = importlib.util.find_spec("pysindy")
+if _PYSINDY_SPEC:
+    import pysindy as ps
+else:  # pragma: no cover - exercised when PySINDy is unavailable
+    ps = None  # type: ignore[assignment]
+
+
+class _SimpleData:
+    """Fallback container mimicking torch_geometric.data.Data."""
+
+    def __init__(self, edge_index, pos, num_nodes):
+        self.edge_index = edge_index
+        self.pos = pos
+        self.num_nodes = num_nodes
 
 # -----------------------------
 # Configs
@@ -36,7 +62,8 @@ class SimConfig:
 # -----------------------------
 def build_knn_graph(cfg: GraphConfig) -> Tuple[Data, np.ndarray, sp.csr_matrix]:
     rng = np.random.default_rng(cfg.seed)
-    torch.manual_seed(cfg.seed)
+    if torch is not None:
+        torch.manual_seed(cfg.seed)
     pos = rng.random((cfg.N, 2), dtype=np.float64)
 
     dists = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
@@ -46,14 +73,36 @@ def build_knn_graph(cfg: GraphConfig) -> Tuple[Data, np.ndarray, sp.csr_matrix]:
     edge_index = np.stack([rows, cols], axis=0)
     edge_index = np.concatenate([edge_index, edge_index[::-1]], axis=1)
 
-    edge_index_t = torch.tensor(edge_index, dtype=torch.long)
-    pos_t = torch.tensor(pos, dtype=torch.float32)
-    G = Data(edge_index=edge_index_t, pos=pos_t, num_nodes=cfg.N)
+    if torch is not None:
+        edge_index_t = torch.tensor(edge_index, dtype=torch.long)
+        pos_t = torch.tensor(pos, dtype=torch.float32)
+    else:
+        edge_index_t = edge_index
+        pos_t = pos.astype(np.float32)
 
-    edge_index_norm, edge_weight_norm = get_laplacian(edge_index_t, normalization="sym", num_nodes=cfg.N)
-    L = to_scipy_sparse_matrix(edge_index_norm, edge_weight_norm, num_nodes=cfg.N).astype(np.float64)
+    if Data is not None and torch is not None:
+        G = Data(edge_index=edge_index_t, pos=pos_t, num_nodes=cfg.N)
+    else:
+        G = _SimpleData(edge_index=edge_index_t, pos=pos_t, num_nodes=cfg.N)
+
+    L = _normalized_laplacian(edge_index, cfg.N)
 
     return G, pos, L
+
+
+def _normalized_laplacian(edge_index: np.ndarray, num_nodes: int) -> sp.csr_matrix:
+    row, col = edge_index
+    weights = np.ones(row.shape[0], dtype=np.float64)
+    adj = sp.coo_matrix((weights, (row, col)), shape=(num_nodes, num_nodes))
+    # Ensure symmetry for undirected graph
+    adj = adj.maximum(adj.T)
+    deg = np.asarray(adj.sum(axis=1)).reshape(-1)
+    deg[deg == 0] = 1.0
+    inv_sqrt_deg = 1.0 / np.sqrt(deg)
+    D_inv_sqrt = sp.diags(inv_sqrt_deg)
+    identity = sp.eye(num_nodes, dtype=np.float64)
+    laplacian = identity - D_inv_sqrt @ adj @ D_inv_sqrt
+    return laplacian.tocsr()
 
 # -----------------------------
 # Dynamics & simulation
@@ -85,71 +134,142 @@ def simulate_system(pos: np.ndarray, L: sp.csr_matrix, gcfg: GraphConfig, scfg: 
 # -----------------------------
 # Tiny GNN to learn x_dot
 # -----------------------------
-class GNNdxdt(nn.Module):
-    def __init__(self, hidden=64):
-        super().__init__()
-        self.gcn1 = GCNConv(1, hidden)
-        self.gcn2 = GCNConv(hidden, hidden)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, 1)
-        )
-    def forward(self, x_node, edge_index):
-        h = F.silu(self.gcn1(x_node, edge_index))
-        h = F.silu(self.gcn2(h, edge_index))
-        return self.mlp(h)
+if torch is not None and GCNConv is not None:
 
-def train_gnn_dxdt(G: Data, X_noisy: np.ndarray, Xdot: np.ndarray, hidden=64, epochs=300, lr=5e-3, wd=1e-5):
-    device = torch.device("cpu")
-    model = GNNdxdt(hidden=hidden).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    class GNNdxdt(nn.Module):
+        def __init__(self, hidden=64):
+            super().__init__()
+            self.gcn1 = GCNConv(1, hidden)
+            self.gcn2 = GCNConv(hidden, hidden)
+            self.mlp = nn.Sequential(
+                nn.Linear(hidden, hidden), nn.SiLU(),
+                nn.Linear(hidden, 1)
+            )
 
-    x_tensor = torch.tensor(X_noisy[..., None], dtype=torch.float32, device=device)  # (T,N,1)
-    y_tensor = torch.tensor(Xdot[...,  None], dtype=torch.float32, device=device)   # (T,N,1)
-    T = X_noisy.shape[0]
-    T_train = int(0.7 * T)
-    edge_index = G.edge_index.to(device)
+        def forward(self, x_node, edge_index):
+            h = F.silu(self.gcn1(x_node, edge_index))
+            h = F.silu(self.gcn2(h, edge_index))
+            return self.mlp(h)
 
-    model.train()
-    for _ in range(epochs):
-        t_idx = np.random.randint(0, T_train)
-        opt.zero_grad()
-        pred = model(x_tensor[t_idx], edge_index)
-        loss = F.mse_loss(pred, y_tensor[t_idx])
-        loss.backward()
-        opt.step()
+    def train_gnn_dxdt(G: Data, X_noisy: np.ndarray, Xdot: np.ndarray, hidden=64, epochs=300, lr=5e-3, wd=1e-5):
+        device = torch.device("cpu")
+        model = GNNdxdt(hidden=hidden).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
-    model.eval()
-    with torch.no_grad():
-        preds = [model(x_tensor[t], edge_index).squeeze(-1).cpu().numpy() for t in range(T)]
-    Xdot_hat = np.stack(preds, axis=0)
-    return model, Xdot_hat
+        x_tensor = torch.tensor(X_noisy[..., None], dtype=torch.float32, device=device)  # (T,N,1)
+        y_tensor = torch.tensor(Xdot[...,  None], dtype=torch.float32, device=device)   # (T,N,1)
+        T = X_noisy.shape[0]
+        T_train = int(0.7 * T)
+        edge_index = G.edge_index.to(device)
+
+        model.train()
+        for _ in range(epochs):
+            t_idx = np.random.randint(0, T_train)
+            opt.zero_grad()
+            pred = model(x_tensor[t_idx], edge_index)
+            loss = F.mse_loss(pred, y_tensor[t_idx])
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            preds = [model(x_tensor[t], edge_index).squeeze(-1).cpu().numpy() for t in range(T)]
+        Xdot_hat = np.stack(preds, axis=0)
+        return model, Xdot_hat
+
+else:  # pragma: no cover - exercised when torch/PyG is unavailable
+
+    class GNNdxdt:  # type: ignore[override]
+        def __init__(self, *_, **__):
+            raise ImportError("train_gnn_dxdt requires torch and torch_geometric to be installed.")
+
+    def train_gnn_dxdt(*_, **__):  # type: ignore[override]
+        raise ImportError("train_gnn_dxdt requires torch and torch_geometric to be installed.")
 
 # -----------------------------
 # PySINDy custom library
 # -----------------------------
-class GraphLibrary(ps.CustomLibrary):
-    def __init__(self, L: sp.csr_matrix):
-        self.L = L.tocsr()
-        super().__init__(library_functions=[], function_names=[])
-    def fit(self, x, y=None):
-        return self
-    def transform(self, x):
-        raise NotImplementedError("Use transform_graph_time_series(T,N).")
-    def transform_graph_time_series(self, X_TN: np.ndarray) -> np.ndarray:
-        T, N = X_TN.shape
-        x = X_TN.reshape(-1)
-        x2 = x ** 2
-        Lx = np.vstack([(self.L @ X_TN[t]) for t in range(T)]).reshape(-1)
-        return np.stack([x, x2, Lx], axis=1)
-    def get_feature_names(self, input_features=None):
-        return ["x", "x^2", "Lx"]
+if ps is not None:
 
-def run_sindy(Phi: np.ndarray, xdot: np.ndarray, dt: float):
-    opt = ps.STLSQ(alpha=1e-3, threshold=0.02, max_iter=50)
-    sindy = ps.SINDy(feature_library=ps.IdentityLibrary(), optimizer=opt)
-    sindy.fit(Phi, t=dt, x_dot=xdot.reshape(-1, 1))
-    return sindy
+    class GraphLibrary(ps.CustomLibrary):
+        def __init__(self, L: sp.csr_matrix):
+            self.L = L.tocsr()
+            super().__init__(library_functions=[], function_names=[])
+
+        def fit(self, x, y=None):
+            return self
+
+        def transform(self, x):
+            raise NotImplementedError("Use transform_graph_time_series(T,N).")
+
+        def transform_graph_time_series(self, X_TN: np.ndarray) -> np.ndarray:
+            T, N = X_TN.shape
+            x = X_TN.reshape(-1)
+            x2 = x ** 2
+            Lx = np.vstack([(self.L @ X_TN[t]) for t in range(T)]).reshape(-1)
+            return np.stack([x, x2, Lx], axis=1)
+
+        def get_feature_names(self, input_features=None):
+            return ["x", "x^2", "Lx"]
+
+    def run_sindy(Phi: np.ndarray, xdot: np.ndarray, dt: float):
+        opt = ps.STLSQ(alpha=1e-3, threshold=0.02, max_iter=50)
+        sindy = ps.SINDy(feature_library=ps.IdentityLibrary(), optimizer=opt)
+        sindy.fit(Phi, t=dt, x_dot=xdot.reshape(-1, 1))
+        return sindy
+
+else:
+
+    class GraphLibrary:  # type: ignore[override]
+        def __init__(self, L: sp.csr_matrix):
+            self.L = L.tocsr()
+
+        def fit(self, x, y=None):
+            return self
+
+        def transform(self, x):
+            raise NotImplementedError("Use transform_graph_time_series(T,N).")
+
+        def transform_graph_time_series(self, X_TN: np.ndarray) -> np.ndarray:
+            T, N = X_TN.shape
+            x = X_TN.reshape(-1)
+            x2 = x ** 2
+            Lx = np.vstack([(self.L @ X_TN[t]) for t in range(T)]).reshape(-1)
+            return np.stack([x, x2, Lx], axis=1)
+
+        def get_feature_names(self, input_features=None):
+            return ["x", "x^2", "Lx"]
+
+    class _SimpleSINDy:
+        def __init__(self, coefficients: np.ndarray):
+            self._coef = coefficients.reshape(1, -1)
+
+        def coefficients(self) -> np.ndarray:
+            return self._coef
+
+        def print(self, precision: int = 4):  # pragma: no cover - only used in CLI
+            fmt = np.array2string(self._coef, precision=precision, suppress_small=True)
+            print(f"SimpleSINDy coefficients: {fmt}")
+
+    def _stlsq(Phi: np.ndarray, xdot: np.ndarray, threshold: float = 0.02, max_iter: int = 50) -> np.ndarray:
+        coef, *_ = np.linalg.lstsq(Phi, xdot, rcond=None)
+        coef = coef.reshape(-1)
+        for _ in range(max_iter):
+            small = np.abs(coef) < threshold
+            if np.all(~small):
+                break
+            coef[small] = 0.0
+            large_mask = ~small
+            if not np.any(large_mask):
+                break
+            Phi_large = Phi[:, large_mask]
+            solved, *_ = np.linalg.lstsq(Phi_large, xdot, rcond=None)
+            coef[large_mask] = solved
+        return coef
+
+    def run_sindy(Phi: np.ndarray, xdot: np.ndarray, dt: float):  # noqa: ARG001
+        coef = _stlsq(Phi, xdot.reshape(-1))
+        return _SimpleSINDy(coef)
 
 # -----------------------------
 # CLI entry
